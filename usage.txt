@@ -1,0 +1,5 @@
+Thu Feb 22 10:15:28 AEDT 2018 
+the following commands took a while to execute but worked on black quad tower
+    cabal update
+    cabal install ShellCheck
+
