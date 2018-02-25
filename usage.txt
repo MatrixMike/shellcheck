@@ -2,4 +2,17 @@ Thu Feb 22 10:15:28 AEDT 2018
 the following commands took a while to execute but worked on black quad tower
     cabal update
     cabal install ShellCheck
+cabal install ShellCheck
+Resolving dependencies...
+All the requested packages are already installed:
+ShellCheck-0.4.7
+Use --reinstall if you want to reinstall anyway.
+mikeh@mikeh-desktop:/media/mikeh/mikeSpace/shellcheck$ cabal install ShellCheck --reinstall
+Resolving dependencies...
+In order, the following will be installed:
+ShellCheck-0.4.7 (reinstall)
+Warning: Note that reinstalls are always dangerous. Continuing anyway...
+Configuring ShellCheck-0.4.7...
+Building ShellCheck-0.4.7...
+Installed ShellCheck-0.4.7
 
