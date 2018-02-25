@@ -16,3 +16,7 @@ Configuring ShellCheck-0.4.7...
 Building ShellCheck-0.4.7...
 Installed ShellCheck-0.4.7
 
+ ~/.cabal/bin/shellcheck --version
+
+
+
