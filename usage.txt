@@ -1,3 +1,6 @@
+Mon Sep 10 00:58:22 AEST 2018 
+better try cabal update followed by cabal build
+
 Thu Feb 22 10:15:28 AEDT 2018 
 the following commands took a while to execute but worked on black quad tower
     cabal update
