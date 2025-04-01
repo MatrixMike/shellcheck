@@ -13,3 +13,11 @@ cabal-dev
 cabal.sandbox.config
 cabal.config
 .stack-work
+
+### Snap ###
+/snap/.snapcraft/
+/stage/
+/parts/
+/prime/
+*.snap
+/dist-newstyle/
