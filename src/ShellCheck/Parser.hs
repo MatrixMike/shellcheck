@@ -48,6 +48,7 @@ import qualified Control.Monad.Reader as Mr
 import qualified Control.Monad.State as Ms
 import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
+import Debug.Trace
 
 import Test.QuickCheck.All (quickCheckAll)
 
@@ -66,10 +67,14 @@ singleQuote = char '\''
 doubleQuote = char '"'
 variableStart = upper <|> lower <|> oneOf "_"
 variableChars = upper <|> lower <|> digit <|> oneOf "_"
--- Chars to allow in function names
-functionChars = variableChars <|> oneOf ":+?-./^@,"
+-- Chars to allow function names to start with
+functionStartChars = variableChars <|> oneOf ":+?-./^@,"
+-- Chars to allow inside function names
+functionChars = variableChars <|> oneOf "#:+?-./^@,"
+-- Chars to allow function names to start with, using the 'function' keyword
+extendedFunctionStartChars = functionStartChars <|> oneOf "[]*=!"
 -- Chars to allow in functions using the 'function' keyword
-extendedFunctionChars = functionChars <|> oneOf "[]*=!"
+extendedFunctionChars = extendedFunctionStartChars <|> oneOf "[]*=!"
 specialVariable = oneOf (concat specialVariables)
 paramSubSpecialChars = oneOf "/:+-=%"
 quotableChars = "|&;<>()\\ '\t\n\r\xA0" ++ doubleQuotableChars
@@ -1695,16 +1700,17 @@ readAmbiguous prefix expected alternative warner = do
 
 prop_readDollarBraceCommandExpansion1 = isOk readDollarBraceCommandExpansion "${ ls; }"
 prop_readDollarBraceCommandExpansion2 = isOk readDollarBraceCommandExpansion "${\nls\n}"
-readDollarBraceCommandExpansion = called "ksh ${ ..; } command expansion" $ do
+prop_readDollarBraceCommandExpansion3 = isOk readDollarBraceCommandExpansion "${|  REPLY=42; }"
+readDollarBraceCommandExpansion = called "ksh-style ${ ..; } command expansion" $ do
     start <- startSpan
-    try $ do
-        string "${"
-        whitespace
+    c <- try $ do
+            string "${"
+            char '|' <|> whitespace
     allspacing
     term <- readTerm
-    char '}' <|> fail "Expected } to end the ksh ${ ..; } command expansion"
+    char '}' <|> fail "Expected } to end the ksh-style ${ ..; } command expansion"
     id <- endSpan start
-    return $ T_DollarBraceCommandExpansion id term
+    return $ T_DollarBraceCommandExpansion id (if c == '|' then Piped else Unpiped) term
 
 prop_readDollarBraced1 = isOk readDollarBraced "${foo//bar/baz}"
 prop_readDollarBraced2 = isOk readDollarBraced "${foo/'{cow}'}"
@@ -2205,17 +2211,18 @@ readSimpleCommand = called "simple command" $ do
 
 
 readSource :: Monad m => Token -> SCParser m Token
-readSource t@(T_Redirecting _ _ (T_SimpleCommand cmdId _ (cmd:file':rest'))) = do
-    let file = getFile file' rest'
+readSource t@(T_Redirecting _ _ (T_SimpleCommand cmdId _ (cmd:args'))) = do
+    let file = getFile args'
     override <- getSourceOverride
     let literalFile = do
-        name <- override `mplus` getLiteralString file `mplus` stripDynamicPrefix file
+        name <- override `mplus` (getLiteralString =<< file) `mplus` (stripDynamicPrefix =<< file)
         -- Hack to avoid 'source ~/foo' trying to read from literal tilde
         guard . not $ "~/" `isPrefixOf` name
         return name
+    let fileId = fromMaybe (getId cmd) (getId <$> file)
     case literalFile of
         Nothing -> do
-            parseNoteAtId (getId file) WarningC 1090
+            parseNoteAtId fileId WarningC 1090
                 "ShellCheck can't follow non-constant source. Use a directive to specify location."
             return t
         Just filename -> do
@@ -2223,7 +2230,7 @@ readSource t@(T_Redirecting _ _ (T_SimpleCommand cmdId _ (cmd:file':rest'))) = d
             if not proceed
               then do
                 -- FIXME: This actually gets squashed without -a
-                parseNoteAtId (getId file) InfoC 1093
+                parseNoteAtId fileId InfoC 1093
                     "This file appears to be recursively sourced. Ignoring."
                 return t
               else do
@@ -2241,7 +2248,7 @@ readSource t@(T_Redirecting _ _ (T_SimpleCommand cmdId _ (cmd:file':rest'))) = d
                         return (contents, resolved)
                 case input of
                     Left err -> do
-                        parseNoteAtId (getId file) InfoC 1091 $
+                        parseNoteAtId fileId InfoC 1091 $
                             "Not following: " ++ err
                         return t
                     Right script -> do
@@ -2253,18 +2260,19 @@ readSource t@(T_Redirecting _ _ (T_SimpleCommand cmdId _ (cmd:file':rest'))) = d
                             return $ T_SourceCommand id1 t (T_Include id2 src)
 
                         let failed = do
-                            parseNoteAtId (getId file) WarningC 1094
+                            parseNoteAtId fileId WarningC 1094
                                 "Parsing of sourced file failed. Ignoring it."
                             return t
 
                         included <|> failed
   where
-    getFile :: Token -> [Token] -> Token
-    getFile file (next:rest) =
-        case getLiteralString file of
-            Just "--" -> next
-            x -> file
-    getFile file _ = file
+    getFile :: [Token] -> Maybe Token
+    getFile (first:rest) =
+        case getLiteralString first of
+            Just "--" -> rest !!! 0
+            Just "-p" -> rest !!! 1
+            _ -> return first
+    getFile _ = Nothing
 
     getSourcePath t =
         case t of
@@ -2751,6 +2759,8 @@ prop_readFunctionDefinition10 = isOk readFunctionDefinition "function foo () { t
 prop_readFunctionDefinition11 = isWarning readFunctionDefinition "function foo{\ntrue\n}"
 prop_readFunctionDefinition12 = isOk readFunctionDefinition "function []!() { true; }"
 prop_readFunctionDefinition13 = isOk readFunctionDefinition "@require(){ true; }"
+prop_readFunctionDefinition14 = isOk readFunctionDefinition "foo#bar(){ :; }"
+prop_readFunctionDefinition15 = isNotOk readFunctionDefinition "#bar(){ :; }"
 readFunctionDefinition = called "function" $ do
     start <- startSpan
     functionSignature <- try readFunctionSignature
@@ -2768,7 +2778,7 @@ readFunctionDefinition = called "function" $ do
                 string "function"
                 whitespace
             spacing
-            name <- many1 extendedFunctionChars
+            name <- (:) <$> extendedFunctionStartChars <*> many extendedFunctionChars
             spaces <- spacing
             hasParens <- wasIncluded readParens
             when (not hasParens && null spaces) $
@@ -2777,7 +2787,7 @@ readFunctionDefinition = called "function" $ do
             return $ \id -> T_Function id (FunctionKeyword True) (FunctionParentheses hasParens) name
 
         readWithoutFunction = try $ do
-            name <- many1 functionChars
+            name <- (:) <$> functionStartChars <*> many functionChars
             guard $ name /= "time"  -- Interferes with time ( foo )
             spacing
             readParens
@@ -3387,7 +3397,8 @@ readScriptFile sourced = do
         "busybox sh",
         "bash",
         "bats",
-        "ksh"
+        "ksh",
+        "oksh"
         ]
     badShells = [
         "awk",
@@ -3396,6 +3407,7 @@ readScriptFile sourced = do
         "fish",
         "perl",
         "python",
+        "python3",
         "ruby",
         "tcsh",
         "zsh"

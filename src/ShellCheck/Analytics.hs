@@ -123,6 +123,7 @@ nodeChecks = [
     ,checkCaseAgainstGlob
     ,checkCommarrays
     ,checkOrNeq
+    ,checkAndEq
     ,checkEchoWc
     ,checkConstantIfs
     ,checkPipedAssignment
@@ -182,7 +183,6 @@ nodeChecks = [
     ,checkPipeToNowhere
     ,checkForLoopGlobVariables
     ,checkSubshelledTests
-    ,checkInvertedStringTest
     ,checkRedirectionToCommand
     ,checkDollarQuoteParen
     ,checkUselessBang
@@ -204,6 +204,7 @@ nodeChecks = [
     ,checkUnnecessaryParens
     ,checkPlusEqualsNumber
     ,checkExpansionWithRedirection
+    ,checkUnaryTestA
     ]
 
 optionalChecks = map fst optionalTreeChecks
@@ -230,6 +231,13 @@ optionalTreeChecks = [
         cdPositive = "[ \"$var\" ]",
         cdNegative = "[ -n \"$var\" ]"
     }, nodeChecksToTreeCheck [checkNullaryExpansionTest])
+
+    ,(newCheckDescription {
+        cdName = "avoid-negated-conditions",
+        cdDescription = "Suggest removing unnecessary comparison negations",
+        cdPositive = "[ ! \"$var\" -eq 1 ]",
+        cdNegative = "[ \"$var\" -ne 1 ]"
+    }, nodeChecksToTreeCheck [checkUnnecessarilyInvertedTest])
 
     ,(newCheckDescription {
         cdName = "add-default-case",
@@ -798,7 +806,7 @@ checkUnquotedExpansions params =
   where
     check t@(T_DollarExpansion _ c) = examine t c
     check t@(T_Backticked _ c) = examine t c
-    check t@(T_DollarBraceCommandExpansion _ c) = examine t c
+    check t@(T_DollarBraceCommandExpansion _ _ c) = examine t c
     check _ = return ()
     tree = parentMap params
     examine t contents =
@@ -881,13 +889,15 @@ prop_checkShorthandIf6 = verifyNot checkShorthandIf "if foo && bar || baz; then 
 prop_checkShorthandIf7 = verifyNot checkShorthandIf "while foo && bar || baz; do true; done"
 prop_checkShorthandIf8 = verify checkShorthandIf "if true; then foo && bar || baz; fi"
 prop_checkShorthandIf9 = verifyNot checkShorthandIf "foo && [ -x /file ] || bar"
+prop_checkShorthandIf10 = verifyNot checkShorthandIf "foo && bar || true"
+prop_checkShorthandIf11 = verify checkShorthandIf "foo && bar || false"
 checkShorthandIf params x@(T_OrIf _ (T_AndIf id _ b) (T_Pipeline _ _ t))
         | not (isOk t || inCondition) && not (isTestCommand b) =
     info id 2015 "Note that A && B || C is not if-then-else. C may run when A is true."
   where
     isOk [t] = isAssignment t || fromMaybe False (do
         name <- getCommandBasename t
-        return $ name `elem` ["echo", "exit", "return", "printf"])
+        return $ name `elem` ["echo", "exit", "return", "printf", "true", ":"])
     isOk _ = False
     inCondition = isCondition $ getPath (parentMap params) x
 checkShorthandIf _ _ = return ()
@@ -1101,6 +1111,8 @@ checkSingleQuotedVariables params t@(T_SingleQuoted id s) =
                 ,"xprop"
                 ,"alias"
                 ,"sudo" -- covering "sudo sh" and such
+                ,"doas" -- same as sudo
+                ,"run0" -- same as sudo
                 ,"docker" -- like above
                 ,"podman"
                 ,"oc"
@@ -1631,6 +1643,64 @@ checkOrNeq _ (T_OrIf id lhs rhs) = sequence_ $ do
 checkOrNeq _ _ = return ()
 
 
+prop_checkAndEq1 = verifyNot checkAndEq "cow=0; foo=0; if [[ $lol -eq cow && $lol -eq foo ]]; then echo foo; fi"
+prop_checkAndEq2 = verifyNot checkAndEq "lol=0 foo=0; (( a==lol && a==foo ))"
+prop_checkAndEq3 = verify checkAndEq "[ \"$a\" = lol && \"$a\" = foo ]"
+prop_checkAndEq4 = verifyNot checkAndEq "[ a = $cow && b = $foo ]"
+prop_checkAndEq5 = verifyNot checkAndEq "[[ $a = /home && $a = */public_html/* ]]"
+prop_checkAndEq6 = verify checkAndEq "[ $a = a ] && [ $a = b ]"
+prop_checkAndEq7 = verify checkAndEq "[ $a = a ] && [ $a = b ] || true"
+prop_checkAndEq8 = verifyNot checkAndEq "[[ $a == x && $a == x ]]"
+prop_checkAndEq9 = verifyNot checkAndEq "[ 0 -eq $FOO ] && [ 0 -eq $BAR ]"
+prop_checkAndEq10 = verify checkAndEq "(( a == 1 && a == 2 ))"
+prop_checkAndEq11 = verify checkAndEq "[ $x -eq 1 ] && [ $x -eq 2 ]"
+prop_checkAndEq12 = verify checkAndEq "[ 1 -eq $x ] && [ $x -eq 2 ]"
+prop_checkAndEq13 = verifyNot checkAndEq "[ 1 -eq $x ] && [ $x -eq 1 ]"
+prop_checkAndEq14 = verifyNot checkAndEq "[ $a = $b ] && [ $a = $c ]"
+
+checkAndEqOperands "-eq" rhs1 rhs2 = isLiteralNumber rhs1 && isLiteralNumber rhs2
+checkAndEqOperands op rhs1 rhs2 | op == "=" || op == "=="  = isLiteral rhs1 && isLiteral rhs2
+checkAndEqOperands _ _ _ = False
+
+-- For test-level "and": [ x = y -a x = z ]
+checkAndEq _ (TC_And id typ op (TC_Binary _ _ op1 lhs1 rhs1 ) (TC_Binary _ _ op2 lhs2 rhs2))
+    | op1 == op2 && lhs1 == lhs2 && rhs1 /= rhs2 && checkAndEqOperands op1 rhs1 rhs2 =
+        warn id 2333 $ "You probably wanted " ++ (if typ == SingleBracket then "-o" else "||") ++ " here, otherwise it's always false."
+
+-- For arithmetic context "and"
+checkAndEq _ (TA_Binary id "&&" (TA_Binary _ "==" lhs1 rhs1) (TA_Binary _ "==" lhs2 rhs2))
+    | lhs1 == lhs2 && isLiteralNumber rhs1 && isLiteralNumber rhs2 =
+        warn id 2334 "You probably wanted || here, otherwise it's always false."
+
+-- For command level "and": [ x = y ] && [ x = z ]
+checkAndEq _ (T_AndIf id lhs rhs) = sequence_ $ do
+    (lhs1, op1, rhs1) <- getExpr lhs
+    (lhs2, op2, rhs2) <- getExpr rhs
+    guard $ op1 == op2
+    guard $ lhs1 == lhs2 && rhs1 /= rhs2
+    guard $ checkAndEqOperands op1 rhs1 rhs2
+    return $ warn id 2333 "You probably wanted || here, otherwise it's always false."
+  where
+    getExpr x =
+        case x of
+            T_AndIf _ lhs _ -> getExpr lhs -- Fetches x and y in `T_AndIf x (T_AndIf y z)`
+            T_Pipeline _ _ [x] -> getExpr x
+            T_Redirecting _ _ c -> getExpr c
+            T_Condition _ _ c -> getExpr c
+            TC_Binary _ _ op lhs rhs -> orient (lhs, op, rhs)
+            _ -> Nothing
+
+    -- Swap items so that the constant side is rhs (or Nothing if both/neither is constant)
+    orient (lhs, op, rhs) =
+        case (isConstant lhs, isConstant rhs) of
+            (True, False) -> return (rhs, op, lhs)
+            (False, True) -> return (lhs, op, rhs)
+            _ -> Nothing
+
+
+checkAndEq _ _ = return ()
+
+
 prop_checkValidCondOps1 = verify checkValidCondOps "[[ a -xz b ]]"
 prop_checkValidCondOps2 = verify checkValidCondOps "[ -M a ]"
 prop_checkValidCondOps2a = verifyNot checkValidCondOps "[ 3 \\> 2 ]"
@@ -1896,7 +1966,9 @@ prop_checkSpuriousExec8 = verifyNot checkSpuriousExec "exec {origout}>&1- >tmp.l
 prop_checkSpuriousExec9 = verify checkSpuriousExec "for file in rc.d/*; do exec \"$file\"; done"
 prop_checkSpuriousExec10 = verifyNot checkSpuriousExec "exec file; r=$?; printf >&2 'failed\n'; return $r"
 prop_checkSpuriousExec11 = verifyNot checkSpuriousExec "exec file; :"
-checkSpuriousExec _ = doLists
+prop_checkSpuriousExec12 = verifyNot checkSpuriousExec "#!/bin/bash\nshopt -s execfail; exec foo; exec bar; echo 'Error'; exit 1;"
+prop_checkSpuriousExec13 = verify checkSpuriousExec "#!/bin/dash\nshopt -s execfail; exec foo; exec bar; echo 'Error'; exit 1;"
+checkSpuriousExec params t = when (not $ hasExecfail params) $ doLists t
   where
     doLists (T_Script _ _ cmds) = doList cmds False
     doLists (T_BraceGroup _ cmds) = doList cmds False
@@ -2266,7 +2338,7 @@ prop_checkFunctionsUsedExternally2c =
 prop_checkFunctionsUsedExternally3 =
   verifyNotTree checkFunctionsUsedExternally "f() { :; }; echo f"
 prop_checkFunctionsUsedExternally4 =
-  verifyNotTree checkFunctionsUsedExternally "foo() { :; }; sudo \"foo\""
+  verifyNotTree checkFunctionsUsedExternally "foo() { :; }; run0 \"foo\""
 prop_checkFunctionsUsedExternally5 =
   verifyTree checkFunctionsUsedExternally "foo() { :; }; ssh host foo"
 prop_checkFunctionsUsedExternally6 =
@@ -2276,7 +2348,7 @@ prop_checkFunctionsUsedExternally7 =
 prop_checkFunctionsUsedExternally8 =
   verifyTree checkFunctionsUsedExternally "foo() { :; }; command sudo foo"
 prop_checkFunctionsUsedExternally9 =
-  verifyTree checkFunctionsUsedExternally "foo() { :; }; exec -c sudo foo"
+  verifyTree checkFunctionsUsedExternally "foo() { :; }; exec -c doas foo"
 checkFunctionsUsedExternally params t =
     runNodeAnalysis checkCommand params t
   where
@@ -2300,6 +2372,8 @@ checkFunctionsUsedExternally params t =
             "chroot" -> firstNonFlag
             "screen" -> firstNonFlag
             "sudo" -> firstNonFlag
+            "doas" -> firstNonFlag
+            "run0" -> firstNonFlag
             "xargs" -> firstNonFlag
             "tmux" -> firstNonFlag
             "ssh" -> take 1 $ drop 1 $ dropFlags argAndString
@@ -2822,6 +2896,10 @@ prop_checkUnpassedInFunctions11 = verifyNotTree checkUnpassedInFunctions "foo() 
 prop_checkUnpassedInFunctions12 = verifyNotTree checkUnpassedInFunctions "foo() { echo ${!var*}; }; foo;"
 prop_checkUnpassedInFunctions13 = verifyNotTree checkUnpassedInFunctions "# shellcheck disable=SC2120\nfoo() { echo $1; }\nfoo\n"
 prop_checkUnpassedInFunctions14 = verifyTree checkUnpassedInFunctions "foo() { echo $#; }; foo"
+prop_checkUnpassedInFunctions15 = verifyNotTree checkUnpassedInFunctions "foo() { echo ${1-x}; }; foo"
+prop_checkUnpassedInFunctions16 = verifyNotTree checkUnpassedInFunctions "foo() { echo ${1:-x}; }; foo"
+prop_checkUnpassedInFunctions17 = verifyNotTree checkUnpassedInFunctions "foo() { mycommand ${1+--verbose}; }; foo"
+prop_checkUnpassedInFunctions18 = verifyNotTree checkUnpassedInFunctions "foo() { if mycheck; then foo ${1?Missing}; fi; }; foo"
 checkUnpassedInFunctions params root =
     execWriter $ mapM_ warnForGroup referenceGroups
   where
@@ -2838,9 +2916,10 @@ checkUnpassedInFunctions params root =
         case x of
             Assignment (_, _, str, _) -> isPositional str
             _ -> False
+
     isPositionalReference function x =
         case x of
-            Reference (_, t, str) -> isPositional str && t `isDirectChildOf` function
+            Reference (_, t, str) -> isPositional str && t `isDirectChildOf` function && not (hasDefaultValue t)
             _ -> False
 
     isDirectChildOf child parent = fromMaybe False $ do
@@ -2854,6 +2933,7 @@ checkUnpassedInFunctions params root =
     referenceList :: [(String, Bool, Token)]
     referenceList = execWriter $
         doAnalysis (sequence_ . checkCommand) root
+
     checkCommand :: Token -> Maybe (Writer [(String, Bool, Token)] ())
     checkCommand t@(T_SimpleCommand _ _ (cmd:args)) = do
         str <- getLiteralString cmd
@@ -2863,6 +2943,22 @@ checkUnpassedInFunctions params root =
 
     isPositional str = str == "*" || str == "@" || str == "#"
         || (all isDigit str && str /= "0" && str /= "")
+
+    -- True if t is a variable that specifies a default value,
+    -- such as ${1-x} or ${1:-x}.
+    hasDefaultValue t =
+        case t of
+            T_DollarBraced _ True l ->
+                let str = concat $ oversimplify l
+                in isDefaultValueModifier $ getBracedModifier str
+            _ -> False
+
+    isDefaultValueModifier str =
+        case str of
+            ':':c:_ -> c `elem` handlesDefault
+            c:_ -> c `elem` handlesDefault
+            _ -> False
+      where handlesDefault = "-+?"
 
     isArgumentless (_, b, _) = b
     referenceGroups = Map.elems $ foldr updateWith Map.empty referenceList
@@ -2926,7 +3022,8 @@ checkTildeInPath _ _ = return ()
 
 prop_checkUnsupported3 = verify checkUnsupported "#!/bin/sh\ncase foo in bar) baz ;& esac"
 prop_checkUnsupported4 = verify checkUnsupported "#!/bin/ksh\ncase foo in bar) baz ;;& esac"
-prop_checkUnsupported5 = verify checkUnsupported "#!/bin/bash\necho \"${ ls; }\""
+prop_checkUnsupported5 = verifyNot checkUnsupported "#!/bin/bash\necho \"${ ls; }\""
+prop_checkUnsupported6 = verify checkUnsupported "#!/bin/ash\necho \"${ ls; }\""
 checkUnsupported params t =
     unless (null support || (shellType params `elem` support)) $
         report name
@@ -2940,7 +3037,7 @@ checkUnsupported params t =
 shellSupport t =
   case t of
     T_CaseExpression _ _ list -> forCase (map (\(a,_,_) -> a) list)
-    T_DollarBraceCommandExpansion {} -> ("${ ..; } command expansion", [Ksh])
+    T_DollarBraceCommandExpansion {} -> ("${ ..; } command expansion", [Bash, Ksh])
     _ -> ("", [])
   where
     forCase seps | CaseContinue `elem` seps = ("cases with ;;&", [Bash])
@@ -3028,7 +3125,7 @@ checkShouldUseGrepQ params t =
             T_DollarExpansion _ [x] -> getPipeline x
             T_Pipeline _ _ cmds -> return cmds
             _ -> fail "unknown"
-    isGrep = (`elem` ["grep", "egrep", "fgrep", "zgrep"])
+    isGrep = (`elem` ["grep", "egrep", "fgrep", "bz3grep", "bzgrep", "xzgrep", "zgrep", "zipgrep", "zstdgrep"])
 
 prop_checkTestArgumentSplitting1 = verify checkTestArgumentSplitting "[ -e *.mp3 ]"
 prop_checkTestArgumentSplitting2 = verifyNot checkTestArgumentSplitting "[[ $a == *b* ]]"
@@ -3520,7 +3617,7 @@ checkSplittingInArrays params t =
         _ -> return ()
     checkPart part = case part of
         T_DollarExpansion id _ -> forCommand id
-        T_DollarBraceCommandExpansion id _ -> forCommand id
+        T_DollarBraceCommandExpansion id _ _ -> forCommand id
         T_Backticked id _ -> forCommand id
         T_DollarBraced id _ str |
             not (isCountingReference part)
@@ -3596,6 +3693,8 @@ prop_checkPipeToNowhere17 = verify checkPipeToNowhere "echo World | cat << 'EOF'
 prop_checkPipeToNowhere18 = verifyNot checkPipeToNowhere "ls 1>&3 3>&1 3>&- | wc -l"
 prop_checkPipeToNowhere19 = verifyNot checkPipeToNowhere "find . -print0 | du --files0-from=/dev/stdin"
 prop_checkPipeToNowhere20 = verifyNot checkPipeToNowhere "find . | du --exclude-from=/dev/fd/0"
+prop_checkPipeToNowhere21 = verifyNot checkPipeToNowhere "yes | cp -ri foo/* bar"
+prop_checkPipeToNowhere22 = verifyNot checkPipeToNowhere "yes | rm --interactive *"
 
 data PipeType = StdoutPipe | StdoutStderrPipe | NoPipe deriving (Eq)
 checkPipeToNowhere :: Parameters -> Token -> WriterT [TokenComment] Identity ()
@@ -3661,6 +3760,7 @@ checkPipeToNowhere params t =
     commandSpecificException name cmd =
         case name of
             "du" -> any ((`elem` ["exclude-from", "files0-from"]) . snd) $ getAllFlags cmd
+            _ | name `elem` interactiveFlagCmds -> hasInteractiveFlag cmd
             _ -> False
 
     warnAboutDupes (n, list@(_:_:_)) =
@@ -3684,7 +3784,7 @@ checkPipeToNowhere params t =
         name <- getCommandBasename cmd
         guard $ name `elem` nonReadingCommands
         guard . not $ hasAdditionalConsumers cmd
-        guard . not $ name `elem` ["cp", "mv", "rm"] && cmd `hasFlag` "i"
+        guard . not $ name `elem` interactiveFlagCmds && hasInteractiveFlag cmd
         let suggestion =
                 if name == "echo"
                 then "Did you want 'cat' instead?"
@@ -3698,6 +3798,9 @@ checkPipeToNowhere params t =
     hasAdditionalProducers = treeContains mayProduce
     treeContains pred t = isNothing $
         doAnalysis (guard . not . pred) t
+
+    interactiveFlagCmds = [ "cp", "mv", "rm" ]
+    hasInteractiveFlag cmd = cmd `hasFlag` "i" || cmd `hasFlag` "interactive"
 
     mayConsume t =
         case t of
@@ -3894,12 +3997,17 @@ checkSubshelledTests params t =
             T_Annotation {} -> True
             _ -> False
 
-prop_checkInvertedStringTest1 = verify checkInvertedStringTest "[ ! -z $var ]"
-prop_checkInvertedStringTest2 = verify checkInvertedStringTest "! [[ -n $var ]]"
-prop_checkInvertedStringTest3 = verifyNot checkInvertedStringTest "! [ -x $var ]"
-prop_checkInvertedStringTest4 = verifyNot checkInvertedStringTest "[[ ! -w $var ]]"
-prop_checkInvertedStringTest5 = verifyNot checkInvertedStringTest "[ -z $var ]"
-checkInvertedStringTest _ t =
+prop_checkUnnecessarilyInvertedTest1 = verify checkUnnecessarilyInvertedTest "[ ! -z $var ]"
+prop_checkUnnecessarilyInvertedTest2 = verify checkUnnecessarilyInvertedTest "! [[ -n $var ]]"
+prop_checkUnnecessarilyInvertedTest3 = verifyNot checkUnnecessarilyInvertedTest "! [ -x $var ]"
+prop_checkUnnecessarilyInvertedTest4 = verifyNot checkUnnecessarilyInvertedTest "[[ ! -w $var ]]"
+prop_checkUnnecessarilyInvertedTest5 = verifyNot checkUnnecessarilyInvertedTest "[ -z $var ]"
+prop_checkUnnecessarilyInvertedTest6 = verify checkUnnecessarilyInvertedTest "! [ $var != foo ]"
+prop_checkUnnecessarilyInvertedTest7 = verify checkUnnecessarilyInvertedTest "[[ ! $var == foo ]]"
+prop_checkUnnecessarilyInvertedTest8 = verifyNot checkUnnecessarilyInvertedTest "! [[ $var =~ .* ]]"
+prop_checkUnnecessarilyInvertedTest9 = verify checkUnnecessarilyInvertedTest "[ ! $var -eq 0 ]"
+prop_checkUnnecessarilyInvertedTest10 = verify checkUnnecessarilyInvertedTest "! [[ $var -gt 3 ]]"
+checkUnnecessarilyInvertedTest _ t =
     case t of
         TC_Unary _ _ "!" (TC_Unary _ _ op _) ->
             case op of
@@ -3912,7 +4020,34 @@ checkInvertedStringTest _ t =
                 "-n" -> style (getId t) 2237 "Use [ -z .. ] instead of ! [ -n .. ]."
                 "-z" -> style (getId t) 2237 "Use [ -n .. ] instead of ! [ -z .. ]."
                 _ -> return ()
+        TC_Unary _ _ "!" (TC_Binary _ bracketStyle op _ _) ->
+            maybeSuggestRewrite True bracketStyle (getId t) op
+        T_Banged _ (T_Pipeline _ _
+          [T_Redirecting _ _ (T_Condition _ _ (TC_Binary _ bracketStyle op _ _))]) ->
+            maybeSuggestRewrite False bracketStyle (getId t) op
         _ -> return ()
+  where
+    inversionMap = Map.fromList [
+        ("=",  "!="),
+        ("==", "!="),
+        ("!=", "="),
+        ("-eq", "-ne"),
+        ("-ne", "-eq"),
+        ("-le", "-gt"),
+        ("-gt", "-le"),
+        ("-ge", "-lt"),
+        ("-lt", "-ge")
+      ]
+    maybeSuggestRewrite bangInside bracketStyle id op = sequence_ $ do
+        newOp <- Map.lookup op inversionMap
+        let oldExpr = "a " ++ op ++ " b"
+        let newExpr = "a " ++ newOp ++ " b"
+        let bracket s = if bracketStyle == SingleBracket then "[ " ++ s ++ " ]" else "[[ " ++ s ++ " ]]"
+        return $
+            if bangInside
+                then style id 2335 $ "Use " ++ newExpr ++ " instead of ! " ++ oldExpr ++ "."
+                else style id 2335 $ "Use " ++ (bracket newExpr) ++ " instead of ! " ++ (bracket oldExpr) ++ "."
+
 
 prop_checkRedirectionToCommand1 = verify checkRedirectionToCommand "ls > rm"
 prop_checkRedirectionToCommand2 = verifyNot checkRedirectionToCommand "ls > 'rm'"
@@ -4226,14 +4361,16 @@ prop_checkComparisonWithLeadingX3 = verifyNot checkComparisonWithLeadingX "[ $fo
 prop_checkComparisonWithLeadingX4 = verifyNot checkComparisonWithLeadingX "test $foo = xbar"
 prop_checkComparisonWithLeadingX5 = verify checkComparisonWithLeadingX "[ \"x$foo\" = 'xlol' ]"
 prop_checkComparisonWithLeadingX6 = verify checkComparisonWithLeadingX "[ x\"$foo\" = x'lol' ]"
+prop_checkComparisonWithLeadingX7 = verify checkComparisonWithLeadingX "[ X$foo != Xbar ]"
 checkComparisonWithLeadingX params t =
     case t of
-        TC_Binary id typ op lhs rhs | op == "=" || op == "==" ->
-            check lhs rhs
-        T_SimpleCommand _ _ [cmd, lhs, op, rhs] |
-            getLiteralString cmd == Just "test" &&
-                getLiteralString op `elem` [Just "=", Just "=="] ->
-                    check lhs rhs
+        TC_Binary id typ op lhs rhs
+            | op `elem` ["=", "==", "!="] ->
+                check lhs rhs
+        T_SimpleCommand _ _ [cmd, lhs, op, rhs]
+            | getLiteralString cmd == Just "test" &&
+              getLiteralString op `elem` [Just "=", Just "==", Just "!="] ->
+                check lhs rhs
         _ -> return ()
   where
     msg = "Avoid x-prefix in comparisons as it no longer serves a purpose."
@@ -4243,18 +4380,19 @@ checkComparisonWithLeadingX params t =
         return $ styleWithFix (getId lhs) 2268 msg $ fixWith [l, r]
 
     fixLeadingX token =
-         case getWordParts token of
-            T_Literal id ('x':_):_ ->
+        case getWordParts token of
+            T_Literal id (c:_):_ | toLower c == 'x' ->
                 case token of
-                    -- The side is a single, unquoted x, so we have to quote
-                    T_NormalWord _ [T_Literal id "x"] ->
+                    -- The side is a single, unquoted x or X, so we have to quote
+                    T_NormalWord _ [T_Literal id [c]] ->
                         return $ replaceStart id params 1 "\"\""
                     -- Otherwise we can just delete it
                     _ -> return $ replaceStart id params 1 ""
-            T_SingleQuoted id ('x':_):_ ->
-                -- Replace the single quote and x
-                return $ replaceStart id params 2 "'"
+            T_SingleQuoted id (c:rest):_ | toLower c == 'x' ->
+                    -- Replace the single quote and the character x or X
+                    return $ replaceStart id params 2 "'"
             _ -> Nothing
+
 
 prop_checkAssignToSelf1 = verify checkAssignToSelf "x=$x"
 prop_checkAssignToSelf2 = verify checkAssignToSelf "x=${x}"
@@ -5066,7 +5204,7 @@ checkExpansionWithRedirection params t =
     case t of
         T_DollarExpansion id [cmd] -> check id cmd
         T_Backticked id [cmd] -> check id cmd
-        T_DollarBraceCommandExpansion id [cmd] -> check id cmd
+        T_DollarBraceCommandExpansion id _ [cmd] -> check id cmd
         _ -> return ()
   where
     check id pipe =
@@ -5090,6 +5228,15 @@ checkExpansionWithRedirection params t =
         err redirectId 2328 $ "This redirection takes output away from the command substitution" ++ if suggestTee then " (use tee to duplicate)." else "."
 
 
+prop_checkUnaryTestA1 = verify checkUnaryTestA "[ -a foo ]"
+prop_checkUnaryTestA2 = verify checkUnaryTestA "[ ! -a foo ]"
+prop_checkUnaryTestA3 = verifyNot checkUnaryTestA "[ foo -a bar ]"
+checkUnaryTestA params t =
+    case t of
+        TC_Unary id _ "-a" _ ->
+            styleWithFix id 2331 "For file existence, prefer standard -e over legacy -a." $
+                fixWith [replaceStart id params 2 "-e"]
+        _ -> return ()
 
 return []
 runTests =  $( [| $(forAllProperties) (quickCheckWithResult (stdArgs { maxSuccess = 1 }) ) |])
