@@ -20,6 +20,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE NondecreasingIndentation #-}
 module ShellCheck.Analytics (checker, optionalChecks, ShellCheck.Analytics.runTests) where
 
 import ShellCheck.AST
@@ -169,6 +170,7 @@ nodeChecks = [
     ,checkConcatenatedDollarAt
     ,checkTildeInPath
     ,checkReadWithoutR
+    ,checkCpLegacyR
     ,checkLoopVariableReassignment
     ,checkTrailingBracket
     ,checkReturnAgainstZero
@@ -2349,6 +2351,8 @@ prop_checkFunctionsUsedExternally8 =
   verifyTree checkFunctionsUsedExternally "foo() { :; }; command sudo foo"
 prop_checkFunctionsUsedExternally9 =
   verifyTree checkFunctionsUsedExternally "foo() { :; }; exec -c doas foo"
+prop_checkFunctionsUsedExternally10 =
+  verifyTree checkFunctionsUsedExternally "foo() { :; }; timeout -p 10 foo"
 checkFunctionsUsedExternally params t =
     runNodeAnalysis checkCommand params t
   where
@@ -2376,6 +2380,7 @@ checkFunctionsUsedExternally params t =
             "run0" -> firstNonFlag
             "xargs" -> firstNonFlag
             "tmux" -> firstNonFlag
+            "timeout" -> take 1 $ drop 1 $ dropFlags argAndString
             "ssh" -> take 1 $ drop 1 $ dropFlags argAndString
             "find" -> take 1 $ drop 1 $
                 dropWhile (\x -> fst x `notElem` findExecFlags) argAndString
@@ -3244,6 +3249,17 @@ checkReadWithoutR _ t@T_SimpleCommand {} | t `isUnqualifiedCommand` "read"
         getLiteralString t
 
 checkReadWithoutR _ _ = return ()
+
+prop_checkCpLegacyR1 = verify checkCpLegacyR "cp -r foo bar"
+prop_checkCpLegacyR2 = verifyNot checkCpLegacyR "cp -R foo bar"
+checkCpLegacyR params t@T_SimpleCommand {} | t `isUnqualifiedCommand` "cp" = case legacyFlag of
+  Just (t, _) -> warnWithFix (getId t) 2336 "cp -r behavior is implementation-defined"
+                     (fixWith [replaceToken (getId t) params "-R"])
+  Nothing -> return ()
+  where
+    flags = getAllFlags t
+    legacyFlag = find ((=="r") . snd) flags
+checkCpLegacyR _ _ = return ()
 
 prop_checkUncheckedCd1 = verifyTree checkUncheckedCdPushdPopd "cd ~/src; rm -r foo"
 prop_checkUncheckedCd2 = verifyNotTree checkUncheckedCdPushdPopd "cd ~/src || exit; rm -r foo"
